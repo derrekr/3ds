@@ -1,0 +1,1213 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+
+		<title>Nintendo Hacking 2016 - Game Over 33C3</title>
+
+		<link rel="stylesheet" href="css/reveal.css">
+		<link rel="stylesheet" href="css/theme/moon.css">
+
+		<!-- Theme used for syntax highlighting of code -->
+		<link rel="stylesheet" href="lib/css/zenburn.css">
+
+		<!-- Printing and PDF exports -->
+		<script>
+			var link = document.createElement( 'link' );
+			link.rel = 'stylesheet';
+			link.type = 'text/css';
+			link.href = window.location.search.match( /print-pdf/gi ) ? 'css/print/pdf.css' : 'css/print/paper.css';
+			document.getElementsByTagName( 'head' )[0].appendChild( link );
+		</script>
+	</head>
+	<body>
+		<div class="reveal">
+			<div class="slides">
+				<section>
+					<h1>Nintendo Hacking 2016</h1>
+					<!--<h2>GAME OVER</h2>-->
+					<!--<img class="plain" style="background:#111" data-src="res/game_over.png">-->
+					<img class="plain" style="background:#002b36" data-src="res/game_over_sms.png">
+					<p><small><a target="_blank" href="https://twitter.com/derrekr6">@derrekr6</a>, <a target="_blank" href="https://twitter.com/naehrwert">@naehrwert</a>, <a target="_blank" href="https://twitter.com/nedwilliamson">@nedwilliamson</a></small></p>
+				</section>
+
+
+				<section>
+					<h1>State of the Wii U</h1>
+					<list>
+						<li class="fragment" data-fragment-index="1">fail0verflow's Console Hacking 2013</li>
+						<li class="fragment" data-fragment-index="2">Public webkit exploit in 2015</li>
+					</list>
+					<h2 class="fragment" data-fragment-index="3">We wanted more access</h2>
+					<list>
+						<li class="fragment" data-fragment-index="4">PPC Kernel</li>
+						<li class="fragment" data-fragment-index="5">IOSU User (not considered here)</li>
+						<li class="fragment" data-fragment-index="6">IOSU Kernel</li>
+					</list>
+				</section>
+
+				<section>
+					<h1>PPC Kernel</h1>
+					<list>
+						<li class="fragment" data-fragment-index="1">Standard basic security measures, though no ASLR</li>
+						<li class="fragment" data-fragment-index="2">~140 syscalls</li>
+						<li class="fragment" data-fragment-index="3">RPL dynamic libraries contain function names</li>
+						<li class="fragment" data-fragment-index="4">Several exports in <font color="yellow">coreinit.rpl</font> are simply syscall shims &rarr; naming syscalls is relatively easy</li>
+						<li class="fragment" data-fragment-index="5">Syscalls use safe copy_in/copy_out for data</li>
+						<li class="fragment" data-fragment-index="6">Reverse each syscall and search for bugs</li>
+					</list>
+				</section>
+
+				<section>
+					<h1>ioctlvhax</h1>
+					<h2 class="fragment" data-fragment-index="1">Or why indirections are hard</h2>
+					<list>
+						<li class="fragment" data-fragment-index="2">Bug in <font color="yellow">IPCKDriver_SubmitRequest</font> syscall</li>
+						<li class="fragment" data-fragment-index="3">Use copy_in for top level request structure</li>
+						<li class="fragment" data-fragment-index="4">Ignore that for the second level and hope for the best</li>
+					</list>
+				</section>
+
+				<section>
+					<p>Relevant part of IPCKDriver_SubmitRequest syscall</p>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="c">
+struct ioctlv_ent {
+    u32 phys;
+    u32 size;
+    u32 virt;
+};
+
+struct ios_packet {
+    /* ... */
+    union {
+        /* ... */
+        struct { struct ioctlv_ent *ent; } ioctlv;
+    } virt;
+}
+
+struct ios_packet pkt;
+copy_in(&pkt, ...);
+/* ... */
+for (idx = 0; idx < pkt.args.ioctlv.num_in; idx++) {
+    struct ioctlv_ent *ent = &pkt.virt.ioctlv.ent[idx];
+    <mark>ent->phys = KiEffectiveToPhysical(..., ent->virt);</mark> //Uhhhhhm?!
+    if (!IPCKDriver_CheckAddress(..., ent->phys, ent->size))
+        return ERR;
+}
+					</code></pre>
+				</section>
+
+				<section>
+					<h1>Looks hard to exploit</h1>
+					<h2 class="fragment" data-fragment-index="1">One byte to rule them all</h2>
+					<list>
+						<li class="fragment" data-fragment-index="2">KiEffectiveToPhysical returns zero for garbage input</li>
+						<li class="fragment" data-fragment-index="3">Overwrite last byte of syscall handler address in syscall table with zero and hope for the best (i.e. a usable gadget)</li>
+						<li class="fragment" data-fragment-index="4">JIT area is <font color="red">executable</font> from kernel mode</li>
+					</list>
+				</section>
+
+				<section>
+					<p>Relevant part of PPC kernel</p>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="asm">
+; PPC kernel version 11464
+
+0xFFF0F7<mark style="background:green;">00</mark> cmpwi r31, 0
+0xFFF0F704 mtlr r28
+0xFFF0F708 blr ; User controlled branch.
+; ...
+0xFFF0F7<mark style="background:green;">F0</mark> KeLoaderCall:
+; ...
+0xFFEAA0E0 syscall_table:
+; ...
+0xFFEAA21C .long KeLoaderCall ; =0xFFF0F7<mark style="background:green;">F0</mark>, syscall 0x4F
+					</code></pre>
+					<p class="fragment" data-fragment-index="1">Relevant part of exploit</p>
+					<pre class="fragment" data-fragment-index="1"><code data-trim data-noescape style="max-height:initial;" class="c">
+void kmode_func() { /* Just kernel mode things. */ }
+
+/* Overwrite last byte of syscall 0x4F handler address with 0x00. */
+ioctlv(..., (struct ioctlv_ent *)(0xFFEAA21C+3));
+
+/* Execute syscall 0x4F with r28 set to kmode_func. */
+asm ("mr 28, %0\n"
+     "li 0, 0x4F00\n"
+     "sc\n" : : "r"((u32)kmode_func));
+					</code></pre>
+				</section>
+
+				<section>
+					<h2 class="fragment" data-fragment-index="1">PPC Kernel Mode Arbitrary Code Execution &#x26a1;</h2>
+					<p class="fragment" data-fragment-index="2">Quite nice but we can and need to go deeper</p>
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="1">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+
+				<section>
+					<h1>IOSU architecture</h1>
+					<list>
+						<li class="fragment" data-fragment-index="1">Present as one big ELF file (includes kernel and services)</li>
+						<li class="fragment" data-fragment-index="2">Running on Starbuck, extra hardware NX, again no ASLR</li>
+						<li class="fragment" data-fragment-index="3">Microkernel with ~140 syscalls</li>
+						<li class="fragment" data-fragment-index="4">Kernel initially spawns services as usermode processes</li>
+						<li class="fragment" data-fragment-index="5">Again reverse each syscall and search for bugs</li>
+					</list>
+				</section>
+
+				<section>
+					<h1>mqhax</h1>
+					<h2 class="fragment" data-fragment-index="1">Integer overflow? never heard of...</h2>
+					<pre class="fragment" data-fragment-index="2"><code data-trim data-noescape style="max-height:initial;" class="c">
+int IOS_CreateMessageQueue(u32 *buf, int num_ents) {
+    if (!check_addr_arm(buf, <mark>4 * num_ents</mark>, ...))
+	    return ERR;
+    /* ... */
+    new_queue->buf = buf;
+    <mark>new_queue->max_ents = num_ents;</mark>
+    /* ... */
+    return new_queue->id;
+}
+					</code></pre>
+					<pre class="fragment" data-fragment-index="2"><code data-trim data-noescape style="max-height:initial;" class="c">
+int IOS_SendMessage(int id, u32 msg, u32 flags) {
+    /* ... */
+    msg_queue->buf[msg_queue->pos++] = msg;
+    /* ... */
+}
+					</code></pre>
+				</section>
+
+				<section>
+					<h2>IOSU ELF Section flags</h2>
+					<table class="fragment" data-fragment-index="1">
+							<tr style="font-size: 22px">
+								<td>Section</td>
+								<td>Start</td>
+								<td>End</td>
+								<td>Permissions</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>KERNEL_TEXT</td>
+								<td>08120000</td>
+								<td>08136000</td>
+								<td>RX</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>KERNEL_DATA</td>
+								<td>08140000</td>
+								<td>08142578</td>
+								<td>R</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>KERNEL_DATA</td>
+								<td>08143000</td>
+								<td>08150000</td>
+								<td>RW</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>KERNEL_BSS</td>
+								<td>08150000</td>
+								<td>081B5230</td>
+								<td>RW</td>
+							</tr>
+					</table>
+					<p class="fragment" style="color:yellow" data-fragment-index="2">Actually these permissions are lies.</p>
+				</section>
+
+				<section>
+					<h2>Exploit strategy</h2>
+					<p class="fragment" data-fragment-index="1">Relevant part of memory and IOSU kernel</p>
+					<pre class="fragment" data-fragment-index="1"><code data-trim data-noescape style="max-height:initial;" class="armasm">
+0x0811FFF8 ; valid address
+0x0811FFFC ; valid address
+; Start of IOSU kernel .text section (RWX).
+0x08120000 syscall_4F:
+0x08120000     STMFD SP!, {R4,R5,LR}
+; ...
+					</code></pre>
+					<p class="fragment" data-fragment-index="2">Relevant part of exploit (ROP in reality)</p>
+					<pre class="fragment" data-fragment-index="2"><code data-trim data-noescape style="max-height:initial;" class="c">
+/* Create hax message queue and patch syscall 0x4F. */
+int mq = IOS_CreateMessageQueue(0x08120000 - 8, 0x40000002);
+IOS_SendMessage(mq, 0xDEADC0DE, 1);
+IOS_SendMessage(mq, 0xDEADC0DE, 1);
+IOS_SendMessage(mq, 0xE12FFF13 /* BX R3 */, 1);
+
+/* Use syscall 0x4F for kernel mode shenanigans. */
+					</code></pre>
+					<p class="fragment" data-fragment-index="3">Integer overflow: 4 * 0x40000002 = 0x1<mark>00000008</mark></p>
+				</section>
+
+				<section>
+					<h2 class="fragment" data-fragment-index="1">IOSU Kernel Mode Arbitrary Code Execution &#x26a1;</h2>
+					<p class="fragment" data-fragment-index="2">Lets us also dump the console's OTP and grab all the keys (except for boot1)</p>
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="1">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+
+				<section>
+					<h1>Gaining persistence</h1>
+					<list>
+						<li class="fragment" data-fragment-index="2">Title content is only verified at install time &rarr; <font color="yellow">contenthax</font></li>
+						<li class="fragment" data-fragment-index="3">Only title binary is verified before title execution</li>
+						<li class="fragment" data-fragment-index="4">Modify content of title with JIT permission (DS virtual console &rarr; <font color="yellow">haxchi</font>)</li>
+						<li class="fragment" data-fragment-index="5">Boot title ID can be modified in config file &rarr; <font color="yellow">coldboothax</font></li>
+					</list>
+				</section>
+
+				<section>
+					<h2 class="fragment" data-fragment-index="1">Persistent code execution on coldboot with full control &#x26a1;</h2>
+					<img class="plain fragment" data-fragment-index="2" style="background:#002b36" data-src="res/game_over_q.png">
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="1">
+							<img class="plain" style="background:#002b36" data-src="res/heart_half.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+
+
+
+
+
+
+
+				<!-- WIIU BOOT1 -->
+
+				<section>
+					<img data-src="res/f0f.png">
+				</section>
+
+				<section>
+					<h2>NAND Tracer</h2>
+					<img src="res/slc_tracer.jpg" background-color: transparent;" width="60%" height="60%"/>
+
+					<pre class="fragment" style="line-height:65%";><code data-trim data-noescape class="no-highlight"; style="font-size: 20px;">
+						State: READ    BANK 1 (cmd 0x00 0x30): Addr 0x1348C000 (row 0x26918)<br/>
+State: READ    BANK 1 (cmd 0x00 0x30): Addr 0x1348C800 (row 0x26919)<br/>
+State: READ    BANK 1 (cmd 0x00 0x30): Addr 0x1348D000 (row 0x2691A)
+					</code></pre>
+					<p class="fragment" style="font-size: 32px;"><font color="yellow">boot1 parses an .xml file!</font></p>
+				</section>
+
+				<section>
+					<h1>Boot0</h1>
+					<ul>
+					<li class="fragment" data-fragment-index="1">Can be reenabled and dumped in vWii</li>
+					<li class="fragment" data-fragment-index="2">Locks out boot1 key really early</li>
+					<li class="fragment" data-fragment-index="3">However, it is kept in memory until it's done</li>
+					</ul>
+					<p align="center">
+						<p class="fragment" data-fragment-index="4">We need to exploit boot0 to get the key.</p>
+						<p class="fragment" data-fragment-index="5">...Surprisingly, boot0 is pretty safe.</p>
+					</p>
+				</section>
+
+				<section>
+					<p align="center">
+						<p>How can you exploit something that has no bugs?</p>
+						<p class="fragment" data-fragment-index="1">We have to introduce our own bugs.</p>
+					</p>
+				</section>
+
+				<section>
+					<h1>Fault Injection</h1>
+					<ul>
+					<li class="fragment" data-fragment-index="1">Introduce an error in a device</li>
+					<li class="fragment" data-fragment-index="2">Clock/voltage/reset glitching, EM, ...</li>
+					<li class="fragment" data-fragment-index="3">Cause: mutated instructions, corrupted registers</li>
+					</ul>
+				</section>
+
+				<section data-transition="none">
+					<h2>The weak spot</h2>
+					<ul>
+					<img src="res/boot0_ram_initial.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%" class="fragment" data-fragment-index="1" />
+					<li class="fragment" data-fragment-index="1">boot0 copies itself to RAM @0xD410000 and calls main()</li>
+					<li class="fragment" data-fragment-index="2">Locks OTP slots, initializes Flash Controller etc</li>
+					</ul>
+					<br/><br/><br/><br/><br/><br/><br/>
+				</section>
+
+				<section data-transition="none">
+					<h2>The weak spot</h2>
+					<ul>
+					<img src="res/boot0_ram_hdr.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"  />
+					<li >boot0 copies itself to RAM @0xD410000 and calls main()</li>
+					<li >Locks OTP slots, initializes Flash Controller etc</li>
+					<li >Reads boot1 header to 0xD400000</li>
+					<li class="fragment" data-fragment-index="1">Checks boot1 size field (max size: 0xF000)</li>
+					</ul>
+					<br/><br/><br/><br/><br/>
+				</section>
+
+				<section data-transition="none">
+					<h2>The weak spot</h2>
+					<ul>
+					<img src="res/boot0_ram.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"  />
+					<li >boot0 copies itself to RAM @0xD410000 and calls main()</li>
+					<li >Locks OTP slots, initializes Flash Controller etc</li>
+					<li >Reads boot1 header to 0xD400000</li>
+					<li >Checks boot1 size field (max size: 0xF000)</li>
+					<li >Reads whole boot1 using this size to 0xD400000</li>
+					<li class="fragment" data-fragment-index="1">Verifies boot1 RSA signature and its hash</li>
+					<li class="fragment" data-fragment-index="2">Decrypts boot1 code</li>
+					<li class="fragment" data-fragment-index="3">Clears key and jumps to 0xD400100</li>
+					</ul>
+				</section>
+
+				<section data-transition="none">
+					<h2>The weak spot</h2>
+					<ul>
+					<img src="res/boot0_ram.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"  />
+					<li >boot0 copies itself to RAM @0xD410000 and calls main()</li>
+					<li >Locks OTP slots, initializes Flash Controller etc</li>
+					<li >Reads boot1 header to 0xD400000</li>
+					<font color="red">
+						<li >Checks boot1 size field (max size: 0xF000)</li>
+					</font>
+					<li >Reads whole boot1 using this size to 0xD400000</li>
+					<li >Verifies boot1 RSA signature and its hash</li>
+					<li >Decrypts boot1 code</li>
+					<li >Clears key and jumps to 0xD400100</li>
+					</ul>
+				</section>
+
+				<section data-transition="none">
+					<h2>The weak spot</h2>
+					<ul>
+					<img src="res/boot0_ram_hdr_hax.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"  />
+					<li >boot0 copies itself to RAM @0xD410000 and calls main()</li>
+					<li >Locks OTP slots, initializes Flash Controller etc</li>
+					<li >Reads boot1 header to 0xD400000</li>
+					<li class="fragment" data-fragment-index="1">
+						<font color="yellow">Glitch!</font> (size check bypassed)</li>
+					</ul>
+					<br/><br/><br/><br/><br/>
+				</section>
+
+				<section data-transition="none">
+					<h2>The weak spot</h2>
+					<ul>
+					<img src="res/boot0_ram_hax.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"  />
+					<li >boot0 copies itself to RAM @0xD410000 and calls main()</li>
+					<li >Locks OTP slots, initializes Flash Controller etc</li>
+					<li >Reads boot1 header to 0xD400000</li>
+					<li >
+						<font color="yellow">Glitch!</font> (size check bypassed)</li>
+					<li >Reads whole boot1 using this size to 0xD400000</li>
+					<li class="fragment" data-fragment-index="2">boot0 jumps to our code</li>
+					</ul>
+					<br/><br/><br/>
+				</section>
+
+				<section>
+					<h1>Boot0 Code Exec</h1>
+					<ul>
+					<li class="fragment" data-fragment-index="1">We can dump boot1 key from RAM</li>
+					<li class="fragment" data-fragment-index="2">We didn't even need an exploit</li>
+					<li class="fragment" data-fragment-index="3">It's surprisingly stable</li>
+					</ul>
+				</section>
+
+				<section>
+					<h1>Boot1</h1>
+					<p align="center">
+					<p class="fragment" data-fragment-index="1">Understands the WiiU's filesystem.</p>
+					<p class="fragment" data-fragment-index="2">XML parsing code seems safe :-(</p>
+					<p class="fragment" data-fragment-index="3">Maybe we found a bug...</p>
+					<p class="fragment" data-fragment-index="4">... but we haven't really tried to exploit it.</p>
+					<br/>
+					<p class="fragment" data-fragment-index="5">It's just the WiiU after all.</p>
+					</p>
+				</section>
+
+
+
+
+				<!-- 3DS Soundhax & Kernel hax -->
+
+
+				<section>
+					<h2>Last year...</h2>
+					<ul>
+					<li class="fragment" data-fragment-index="1">we broke userland, kernel and the security processor</li>
+					<li class="fragment" data-fragment-index="2">we broke the secret HW keyscrambler</li>
+					</ul>
+					<p></p>
+					<h2 class="fragment" data-fragment-index="3">Since then...</h2>
+					<ul>
+					<li class="fragment" data-fragment-index="4">Nintendo released <font color="yellow">8 system updates</font>!</li><!-- 7 for 3ds, 1 for wiiu -->
+					<blockquote class="fragment" data-fragment-index="4">Main changes for version 11.2.0-35U: "Further improvements to overall system stability and other minor adjustments have been made to enhance the user experience"</blockquote>
+					<li class="fragment" data-fragment-index="5">Nintendo started a Bug Bounty Program</li>
+					</ul>
+				</section>
+				<section>
+					<h2>Many bugs patched. However:</h2>
+					<ul>
+						<li>This is an excellent environment to find new ones.</li>
+						<li>RE and exploitation cost is reduced dramatically.</li>
+					</ul>
+				</section>
+				<section>
+					<h2>Userspace</h2>
+					<ul>
+						<li>The situation is already quite good here.</li>
+						<li>Several good, reliable game entrypoints.</li>
+						<li>Multiple browser exploits released.</li>
+					</ul>
+				</section>
+				<section>
+					<h2>Why look further?</h2>
+					<ul>
+						<li>Game cart demand leads to price gouging ($52 for CN).</li>
+						<li>Browser checks for latest system version.</li>
+					</ul>
+				</section>
+				<section>
+					<h2>Soundhax</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Parses multiple formats, .mp3, .mp4, playlist, ...</li>
+						<li class="fragment" data-fragment-index="2">All parsing, decoding is custom.</li>
+						<li class="fragment" data-fragment-index="3">Found several low severity issues before one critical one.</li>
+					</ul>
+				</section>
+				<section>
+					<p>MPEG header parsing</p>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="c++">
+#define MAX_NAME_LENGTH 256
+
+MPEG::MPEG() {
+  char *song_name = malloc(MAX_NAME_LENGTH);
+}
+
+MPEG::parse_file(...) {
+  ...
+  MPEGParser::load_song_name(song_name, ...);
+  // parse tags
+  ...
+}
+
+MPEG::load_song_name(dest_buffer, ...) {
+  ...
+  if (ascii) {
+    safe_strncpy(dest_buffer, file->name_tag, MAX_NAME_LENGTH);
+  } else if (unicode) { // starts with 0xFEFF or 0xFFFE (BOM)
+    memcpy(dest_buffer, file->name_tag, file->name_tag_size);
+  }
+  ...
+}
+					</code></pre>
+				</section>
+				<section data-transition="none">
+					<h2>Starting the Exploit</h2>
+						<img src="res/sound_overflow.svg"
+							style="border: none; background-color: transparent;"
+							width="100%" height="100%"  class="fragment" data-fragment-index="1" />
+				</section>
+				<section data-transition="none">
+					<h2>Starting the Exploit</h2>
+						<img src="res/sound_overflow2.svg"
+							style="border: none; background-color: transparent;"
+							width="100%" height="100%"  />
+				</section>
+				<section data-transition="none">
+					<h2>Starting the Exploit</h2>
+						<img src="res/sound_overflow3.svg"
+							style="border: none; background-color: transparent;"
+							width="100%" height="100%"  />
+				</section>
+				<section>
+					<h2>Stack Pivot Time!</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Only one pivot gadget in the binary.</li>
+						<li class="fragment" data-fragment-index="2">Can't use readily-available wide thumb pivots.</li>
+						<li class="fragment" data-fragment-index="3">ARM pivot requires unsatisfiable conditions.</li>
+					</ul>
+				</section>
+				<section>
+					<h2>CTF Workaround :-)</h2>
+					<ul>
+					<li class="fragment" data-fragment-index="1">Overwrite heap free list head with stack address.</li>
+					<li class="fragment" data-fragment-index="2">The next malloc will return a stack address.</li>
+					<li class="fragment" data-fragment-index="3">Constraint 1: Needs fake heap chunk on stack.</li>
+					<li class="fragment" data-fragment-index="4">Constraint 2: Freed chunk needs to be undersized.</li>
+				</ul>
+				</section>
+				<section>
+					<h2>It works.</h2>
+					<ul>
+					<li class="fragment" data-fragment-index="1">Our next tag is memcpy'd to the stack.</li>
+					<li class="fragment" data-fragment-index="2">On that tag, put a ROP chain and shellcode.</li>
+					<li class="fragment" data-fragment-index="3">memcpy shellcode to heap then gspwn.</li>
+				</ul>
+				</section>
+				<section>
+					<h2 class="fragment" data-fragment-index="1">Free Offline Entrypoint &#x26a1;</h2>
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="1">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+				<section>
+					<h2>Kernel</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Last year: lots of attacks on svcControlMemory.</li>
+						<li class="fragment" data-fragment-index="2">Little attention on sync primitives, use after free.</li>
+					</ul>
+				</section>
+				<section>
+					<h2>Design Flaw</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Refcounting assumes only user accesses KObjects.</li>
+						<li class="fragment" data-fragment-index="2">Internal KObject usage never seems to incref.</li>
+						<li class="fragment" data-fragment-index="3">Found 3 UAFs along these lines immediately.</li>
+						<li class="fragment" data-fragment-index="4">For those bug hunting at home, look here :)</li>
+					</ul>
+				</section>
+				<section>
+					<h2>KTimer Object</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Kernel can create timers on behalf of the user.</li>
+						<li class="fragment" data-fragment-index="2">{svcCreateTimer, svcSetTimer, svcCloseHandle}</li>
+						<li class="fragment" data-fragment-index="3">3 modes: one-shot, sticky, <strong>pulse</strong></li>
+					</ul>
+				</section>
+				<section>
+					<h2>Kernel Event Handler Thread</h2>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="c++">
+void KTimer::pulse() {
+  mutex_lock(&ktimer_lock);
+  // reschedule timer
+  mutex_unlock(&ktimer_lock);
+  KSynchronizationObject::Signal(reset_type == PULSE_EVENT);
+}
+
+void KSynchronizationObject::Signal(is_pulse) {
+  mutex_lock(&sched_lock);
+  // signal all waiting objects..
+  if (is_pulse) {
+    // virtual function call, just does `is_signaled = false;`
+    reset_timer_state();
+  }
+  mutex_unlock(&sched_lock);
+}
+</code></pre>
+<p class="fragment" data-fragment-index="2">Nothing prevents an asynchronous CloseHandle!</p>
+				</section>
+				<section>
+					<h2>Fasthax</h2>
+					<pre><code data-trim data-noescape style="max-height:initial;">
+void try_race() {
+	svcCreateTimer(&timer, PULSE_EVENT);
+	// initial_pulse, pulse_period
+	svcSetTimer(timer, 8000, 0x1000000000);
+	svcCloseHandle(timer);
+}
+					</code></pre>
+					<ul>
+					<li class="fragment" data-fragment-index="2">Losing the race is safe.</li>
+					<li class="fragment" data-fragment-index="3">Works within 1000 rounds/1 second.</li>
+				</ul>
+				</section>
+				<section>
+					<h2>Let's exploit this.</h2>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="armasm">
+ROM:FFF25AC8                 LDR             R0, [R7]
+ROM:FFF25ACC                 LDR             R1, [R0,#0x34]
+ROM:FFF25AD0                 MOV             R0, R7
+ROM:FFF25AD4                 BLX             R1      ; controlled
+					</code></pre>
+					<ul>
+					<li class="fragment" data-fragment-index="2">We get a virtual call to reset the timer state.</li>
+					<li class="fragment" data-fragment-index="3">R7 points to our freed object.</li>
+					<li class="fragment" data-fragment-index="4">This is essentially: <code>(*r7+0x34)(r7)</code></li>
+				</ul>
+				</section>
+				<section data-transition="none">
+					<h2>Exploiting UAF</h2>
+					<img src="res/UAF_step1.svg"
+						style="border: none; background-color: transparent;"
+						width="40%" height="40%" class="fragment" data-fragment-index="1" />
+				</section>
+				<section data-transition="none">
+					<h2>Exploiting UAF</h2>
+					<img src="res/UAF_step2.svg"
+						style="border: none; background-color: transparent;"
+						width="40%" height="40%"  />
+				</section>
+				<section data-transition="none">
+					<h2>Exploiting UAF</h2>
+					<img src="res/UAF_step3.svg"
+						style="border: none; background-color: transparent;"
+						width="40%" height="40%"  />
+				</section>
+				<section>
+					<h2>Issue 1: UAF in a Kernel Thread</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">We can't immediately return to userspace.</li>
+						<li class="fragment" data-fragment-index="2">We have to return to a function.</li>
+						<li class="fragment" data-fragment-index="3">Sounds easy. Just return to kernel function.</li>
+					</ul>
+				</section>
+				<section>
+					<h2>Issue 2: Sign Checks</h2>
+					<ul>
+					<li>Kernel code mapping is <code>0xFFF00000-0xFFF2E000</code>.</li>
+					<li>We can't set negative timer values.</li>
+				</ul>
+				</section>
+				<section>
+					<h2>Another Trick</h2>
+					<ul>
+					<li class="fragment" data-fragment-index="1">SetTimer adds current tick to initial time.</li>
+					<li class="fragment" data-fragment-index="2">Overflow not checked when installing timer.</li>
+					<li class="fragment" data-fragment-index="3">Timer schedule values are signed...</li>
+					<li class="fragment" data-fragment-index="4">...so we can overflow and schedule into the past.</li>
+				</ul>
+				</section>
+				<section data-transition="none">
+					<h2>Another Trick</h2>
+					<pre class="fragment" data-fragment-index="1"><code data-trim data-noescape style="max-height:initial;" class="c">
+svcSetTimer(timer,
+0x8000000000000000 - tick_to_ns(svcGetSystemTick()), // initial
+(dest_function & 0x7FFFFFFF) << 32) // period
+</code></pre>
+					<img src="res/pulse_initial.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%" class="fragment" data-fragment-index="1" />
+				</section>
+				<section data-transition="none">
+					<h2>Another Trick</h2>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="c">
+svcSetTimer(timer,
+0x8000000000000000 - tick_to_ns(svcGetSystemTick()), // initial
+(dest_function & 0x7FFFFFFF) << 32) // period
+</code></pre>
+					<img src="res/pulse_step1.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"/>
+				</section>
+				<section data-transition="none">
+					<h2>Another Trick</h2>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="c">
+svcSetTimer(timer,
+0x8000000000000000 - tick_to_ns(svcGetSystemTick()), // initial
+(dest_function & 0x7FFFFFFF) << 32) // period
+</code></pre>
+					<img src="res/pulse_step2.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"  />
+				</section>
+				<section data-transition="none">
+					<h2>Another Trick</h2>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="c">
+svcSetTimer(timer,
+0x8000000000000000 - tick_to_ns(svcGetSystemTick()), // initial
+(dest_function & 0x7FFFFFFF) << 32) // period
+</code></pre>
+					<img src="res/pulse_step3.svg"
+						style="border: none; background-color: transparent;"
+						width="100%" height="100%"  />
+				</section>
+				<section>
+					<h2>Issue 3: No Easy Kernel Function</h2>
+					<list>
+						<li>It's not obvious which function we should return to.</li>
+						<li>There isn't any easy 'backdoor' function.</li>
+					</list>
+				</section>
+				<section>
+					<h2>Time for Trickery ( &#865;&deg; &#860;&#662; &#865;&deg;)</h2>
+				</section>
+				<section>
+					<list>
+						<h2>Quick Memory Mapping Note</h2>
+						<ul>
+						<li class="fragment" data-fragment-index="1">0x20000000-0x24000000 is mappable in userspace.</li>
+						<li class="fragment" data-fragment-index="2">0xE*-0xF* -> 0x20000000-0x30000000 in kernel.</li>
+						<li class="fragment" data-fragment-index="3">0xExxxxxxx is a common instruction in ARM.</li>
+					</ul>
+					</list>
+				</section>
+				<section>
+					<h2>Write an instruction to the next pointer.</h2>
+					<pre><code data-trim data-noescape style="max-height:initial;" class="armasm">
+ROM:FFF1B65C    LDR  R1, [R1,#0xC] ; <- r1 points here
+ROM:FFF1B660    STR  R1, [R0] ; *r0 = *(r1+0xC)
+ROM:FFF1B664    BX   LR ; return cleanly
+ROM:FFF1B668    ADD  R1, R1, #0xC  ; <- *(r1 + 0xC) == 0xE281100C
+					</code></pre>
+				</section>
+				<section>
+					<h2>Done</h2>
+					<img src="res/UAF_step4.svg"
+						style="border: none; background-color: transparent;"
+						width="40%" height="40%"  />
+				</section>
+				<section>
+					<h2 class="fragment" data-fragment-index="1">ARM11 Kernel Code Exec &#x26a1;</h2>
+					<img class="plain fragment" data-fragment-index="2" style="background:#002b36" data-src="res/game_over_q.png">
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="1">
+							<img class="plain" style="background:#002b36" data-src="res/heart_half.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+
+
+				<!-- 3DS BROMs -->
+
+				<section>
+					<h2>The 3DS Bootroms</h2>
+					<ul>
+					<li class="fragment" data-fragment-index="1">One for each processor</li>
+					<li class="fragment" data-fragment-index="2">Load the firmware image</li>
+						<ul>
+							<li class="fragment" data-fragment-index="3">Boot9 (ARM9 BootROM) handles main boot</li>
+						</ul>
+					</li>
+					<li class="fragment" data-fragment-index="4">Set secret keys</li>
+					<li class="fragment" data-fragment-index="5">Locked out prior to firmware launch</li>
+					<li class="fragment" data-fragment-index="6">Print nice error screens</li>
+					</ul>
+				</section>
+
+				<section>
+					<img src="res/CTR_Bootrom_Error.jpg" background-color: transparent;" width="100%" height="100%"/>
+				</section>
+
+				<section>
+					<h2>Bootrom Protection</h2>
+					<ul>
+					<img src="res/boot9.svg" style="border: none; background-color: transparent;" width="140%" height="140%" class="fragment" data-fragment-index="3" />
+					<br/>
+					<li class="fragment" data-fragment-index="1">Disabled partially by writing to <font color="orange"; style="font-size: 28px">CFG_SYSPROT9</font> and <font color="orange"; style="font-size: 28px">CFG_SYSPROT11</font></li>
+					<ul>
+						<li class="fragment" data-fragment-index="2">One shot</li><!-- Cannot be reenabled again, this is not the wiiu :P -->
+					</ul>
+					<li class="fragment" data-fragment-index="3">One half (32 KB) remains visible</li>
+					<ul>
+						<li class="fragment" data-fragment-index="4">Main boot code is hidden</li>
+
+						<code class="fragment" data-fragment-index="5">reset_vector:<br/>b 0xFFFF8000
+						</code>
+					</ul>
+					</ul>
+					<p style="font-size: 32px"; class="fragment"><font color="white">Maybe we can find a bug.</font></p>
+				</section>
+
+				<section>
+					<h2>Unprot_boot9.bin</h2>
+					<p align="center">
+					<p class="fragment" data-fragment-index="1">Contains no keys.</p>
+					<p class="fragment" data-fragment-index="2">Mainly (MMC) driver code.</p>
+					<p class="fragment" data-fragment-index="3">Also talks to AES engine, SPI Flash, ...</p>
+					<p class="fragment" data-fragment-index="4">Includes the ARM Exception Vector Table.</p>
+					</p>
+				</section>
+
+				<section>
+					<h2>ARM Exception Vectors</h2>
+					<p align="center">
+					<img src="res/boot9_vectors.svg" style="border: none; background-color: transparent;" width="90%" height="90%" class="fragment" data-fragment-index="1"/>
+					<table class="fragment" data-fragment-index="1">
+							<tr style="font-size: 22px">
+								<td>Exception</td>
+								<td>Address</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>Reset</td>
+								<td>0xffff0000</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>Undefined Instruction </td>
+								<td>0xffff0004</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>SWI</td>
+								<td>0xffff0008</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>Prefetch Abort</td>
+								<td>0xffff000C</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>Data Abort</td>
+								<td>0xffff0010</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>Reserved</td>
+								<td>0xffff0014</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>IRQ</td>
+								<td>0xffff0018</td>
+							</tr>
+							<tr style="font-size: 22px">
+								<td>FIQ</td>
+								<td>0xffff001C</td>
+							</tr>
+					</table>
+					</p>
+				</section>
+
+				<section data-transition="fade">
+					<h2>Exception Vectors</h2>
+					<p align="center">
+					<p class="fragment" data-fragment-index="1">Hardcoded in the bootrom</p>
+					<p class="fragment" data-fragment-index="2"><font color="yellow">Problem:</font> exception handler routines should not be static.</p>
+					<p style="font-size: 30px" class="fragment" data-fragment-index="3">
+						&rarr; BootROM redirects exceptions to jumptable in ARM9 RAM.</p>
+					<img src="res/vectors_redirection.svg" style="border: none; background-color: transparent;" width="70%" height="70%" class="fragment" data-fragment-index="4" />
+					<p class="fragment" data-fragment-index="5">What about cold boot?</p>
+					</p>
+				</section>
+
+				<section data-transition="fade">
+					<p align="center">
+					<img src="res/vectors_redirection2.svg" style="border: none; background-color: transparent;" width="70%" height="70%" />
+					<p class="fragment" data-fragment-index="1">This is interesting...</p>
+					<p class="fragment" data-fragment-index="2">Not really a bug.</p>
+					<p class="fragment" data-fragment-index="3">Let's assume we could somehow trigger an early exception.</p>
+					<p class="fragment" data-fragment-index="4">Probably would just crash.</p>
+					</p>
+				</section>
+
+				<section>
+					<h2>A Cute HW Flaw</h2>
+					<p align="center">
+					<p class="fragment" data-fragment-index="1">Some RAM is not cleared on reboot.</p>
+					<p class="fragment" data-fragment-index="2">This includes ARM9 RAM.</p>
+					<p class="fragment" data-fragment-index="3">Idea: Write payload to RAM and reboot...</p>
+					<img src="res/vectors_redirection3.svg" style="border: none; background-color: transparent;" width="70%" height="70%" class="fragment" data-fragment-index="3" />
+					<p style="font-size: 30px" class="fragment" data-fragment-index="4">
+						We are just an exception away from BootROM code execution!</p>
+					</p>
+				</section>
+
+				<section>
+					<h2>Exceptions</h2>
+					<p class="fragment" data-fragment-index="1">How do we trigger an exception?</p>
+					<table class="fragment" data-fragment-index="2">
+							<tr style="font-size: 22px">
+								<td>Exception</td>
+								<td>Address</td>
+							</tr>
+							<tr class="fragment highlight-red" data-fragment-index="3" style="font-size: 22px">
+								<td>Reset</td>
+								<td>0xffff0000</td>
+							</tr>
+							<tr class="fragment highlight-green" data-fragment-index="4" style="font-size: 22px">
+								<td>Undefined Instruction </td>
+								<td>0xffff0004</td>
+							</tr>
+							<tr class="fragment highlight-red" data-fragment-index="3" style="font-size: 22px">
+								<td>SWI</td>
+								<td>0xffff0008</td>
+							</tr>
+							<tr class="fragment highlight-green" data-fragment-index="4" style="font-size: 22px">
+								<td>Prefetch Abort</td>
+								<td>0xffff000C</td>
+							</tr>
+							<tr class="fragment highlight-green" data-fragment-index="4" style="font-size: 22px">
+								<td>Data Abort</td>
+								<td>0xffff0010</td>
+							</tr>
+							<tr class="fragment highlight-red" data-fragment-index="3" style="font-size: 22px">
+								<td>Reserved</td>
+								<td>0xffff0014</td>
+							</tr>
+							<tr class="fragment highlight-red" data-fragment-index="3" style="font-size: 22px">
+								<td>IRQ</td>
+								<td>0xffff0018</td>
+							</tr>
+							<tr class="fragment highlight-red" data-fragment-index="3" style="font-size: 22px">
+								<td>FIQ</td>
+								<td>0xffff001C</td>
+							</tr>
+					</table>
+
+					<p align="center" class="fragment" data-fragment-index="5">Fault injection ahoy!</p>
+				</section>
+
+				<section>
+					<h2>Vector-Glitch Hack</h2>
+					<p align="left" class="fragment" data-fragment-index="1">1. Setup vectors in RAM</p>
+					<p align="left" class="fragment" data-fragment-index="2">2. Trigger Reboot</p>
+					<p align="left" class="fragment" data-fragment-index="3">3. Apply Glitching Magic</p>
+					<p align="left" class="fragment" data-fragment-index="4">4. Reset again</p>
+					<p align="left" class="fragment" data-fragment-index="5">5. Dump BootROM from memory</p>
+					<br/>
+					<p class="fragment" data-fragment-index="6">Not very stable ...</p>
+				</section>
+
+				<section>
+					<h1>BootROM dumped!</h1>
+					<p align="center">
+					<br/>
+					<p>... but works for me.&trade;</p>
+					<br/>
+					2F88744FEED717856386400A44BBA4B9<br/>
+					CA62E76A32C715D4F309C399BF28166F
+					</p>
+					
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="1">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+
+				<section>
+					<h2>Prologue</h2>
+					<p>In Februray 2014 a FCC documented became public.</p>
+					<img src="res/2ds_fcc_filling.jpg" style="border: none; background-color: transparent;" width="40%" height="40%" class="fragment" data-fragment-index="2" />
+				</section>
+
+				<section>
+					<p>Nintendo has changed the CPU of the Nintendo 2DS.</p>
+					<blockquote class="fragment" data-fragment-index="1">
+						"The difference between FTR-001 and FTR-001(-01) is from CPU
+						with a different security function of the initial program loader
+						that is installed in each model"
+					</blockquote>
+					<br/>
+					<p class="fragment" data-fragment-index="2">
+						<font color="white">There must be a huge bug in the BootROM.</font>
+					</p>
+				</section>
+
+				<section>
+					<h1>Boot9</h1>
+					<p>Main boot method: NAND (MMC)</p> <!-- SD code is unsused -->
+					<p>Alternative: SPI Flash</p>
+					<p>Only boots encrypted, signed firmware images.</p>
+					<p>Different RSA keys for NAND and non-NAND boot methods.</p>
+					<p>Two seperate sets of keys for retail/dev mode.</p>
+					<!-- <p>Some keys are copied over from ARM11 memory.</p> -->
+				</section>
+
+				<section>
+					<h2>Boot Walkthrough</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Selects boot device</li>
+						<li class="fragment" data-fragment-index="2">Loads FIRM header and RSA signature</li>
+						<li class="fragment" data-fragment-index="3">Hashes the header and verifies the sig</li>
+						<li class="fragment" data-fragment-index="4">Loads and verifies FIRM sections</li>
+					</ul>
+				</section>
+
+				<section>
+					<h2>RSA signatures</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">They are using PKCS</li>
+						<li class="fragment" data-fragment-index="2">RSA-2048 (0x100 bytes)</li>
+						<li class="fragment" data-fragment-index="3">Embedded ASN.1 Encoded SHA-256 hash</li>
+						<ul>
+							<li class="fragment" data-fragment-index="4">A padding is required</li>
+							<li class="fragment" data-fragment-index="5">Padding is deterministic (0xFF bytes)</li>
+						</ul>
+					</ul>
+					<p class="fragment" data-fragment-index="6">They decided to write their own signature parser...</p>
+				</section>
+
+				<section>
+					<h2>RSA The Nintendo Way (Again)</h2>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Padding parser code is messed up</li>
+						<ul>
+							<li class="fragment" data-fragment-index="2">Flag-Byte tells if padding should be checked.</li>
+							<li class="fragment" data-fragment-index="3">Weak Bounds checking</li>
+						</ul>
+						<li class="fragment" data-fragment-index="4">ASN.1 parser is very simplified</li>
+						<ul>
+							<li class="fragment" data-fragment-index="5">It's parsing length fields</li>
+							<li class="fragment" data-fragment-index="6">There's no Bounds checking</li>
+							<li class="fragment" data-fragment-index="7">current offset + length = beginning of the hash</li>
+							<li class="fragment" data-fragment-index="8">Final pointer is for comparison against calculated hash</li>
+						</ul>
+						<li class="fragment" data-fragment-index="9">It only checks a few bytes in the signature</li>
+						<li class="fragment" data-fragment-index="10">We can bruteforce a perfect signature...</li>
+						<li class="fragment" data-fragment-index="11">... where the final pointer matches the pointer of the calculated hash</li>
+					</ul>
+				</section>
+
+				<section>
+					<h1>sighax</h1>
+					<ul>
+						<li class="fragment" data-fragment-index="1">We can sign our own firmwares.</li>
+						<li class="fragment" data-fragment-index="2">~62 millions vulnerable devices.</li>
+						<li class="fragment" data-fragment-index="3">Nintendo can't fix it.</li>
+					</ul>
+					
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="3">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+
+				<section>
+					<p>We haven't dumped the ARM11 BootROM yet.</p>
+					<p class="fragment" data-fragment-index="1">We could do the Vector-Glitch Hack again...</p>
+					<p class="fragment" data-fragment-index="2">... but let's try something else.</p>
+				</section>
+
+				<section>
+					<h1>Dumping Boot11</h1>
+					<ul>
+						<li class="fragment" data-fragment-index="1">Unprotected Boot11 code references ARM11 RAM</li>
+						<p align="center" class="fragment" data-fragment-index="2">Can we overwrite any Boot11 data?</p>
+						<li class="fragment" data-fragment-index="3">Boot9 checks firmware sections</li>
+						<li class="fragment" data-fragment-index="4">All Boot9 data regions are blacklisted.</li>
+						<br/>
+						<br/>
+						<p align="center" class="fragment" data-fragment-index="5">They forgot to blacklist the Boot11 data region!</p>
+					</ul>
+				</section>
+
+				<section>
+					<h1>Boot11 dumped!</h1>
+					<p align="center">
+					<br/>
+					<p>Well, that was easy...</p>
+					<br/>
+					74DAACE1F8067B66CC81FC307A3FDB50<br/>
+					9CBEDC32F903AEBE906144DEA7A07512
+					</p>
+					
+					<div>
+						<p style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;">
+							<img class="plain" style="background:#002b36" data-src="res/heart_full.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+						<p class="fragment fade-in" style="position:absolute; margin-left:auto; margin-right:auto; left:0; right:0;" data-fragment-index="3">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+							<img class="plain" style="background:#002b36" data-src="res/heart_empty.png">
+						</p>
+					</div>
+				</section>
+
+				<section>
+					<p align="center">
+						~ Summer 2015
+					</p>
+				</section>
+
+				<section data-transition="slide-in fade-out">
+					<img data-src="res/switch.jpg">
+				</section>
+				<section data-transition="slide-out fade-in">
+					<img data-src="res/reggie.png">
+				</section>
+
+				<section>
+					<h1>Questions?</h1>
+					<img data-src="res/zelda2-gameover.png">
+					<p>
+						<a target="_blank" href="https://twitter.com/derrekr6">@derrekr6</a>, <a target="_blank" href="https://twitter.com/naehrwert">@naehrwert</a>, <a target="_blank" href="https://twitter.com/nedwilliamson">@nedwilliamson</a>
+						<br>
+						<a target="_blank" href="https://www.3dbrew.org/wiki/Main_Page">3dbrew.org</a>
+						<br>
+						<a target="_blank" href="http://wiiubrew.org/wiki/Main_Page">wiiubrew.org</a>
+					</p>
+				</section>
+			</div>
+		</div>
+
+		<script src="lib/js/head.min.js"></script>
+		<script src="js/reveal.js"></script>
+
+		<script>
+			// More info https://github.com/hakimel/reveal.js#configuration
+			Reveal.initialize({
+				history: true,
+
+				// More info https://github.com/hakimel/reveal.js#dependencies
+				dependencies: [
+					{ src: 'plugin/markdown/marked.js' },
+					{ src: 'plugin/markdown/markdown.js' },
+					{ src: 'plugin/notes/notes.js', async: true },
+					{ src: 'plugin/highlight/highlight.js', async: true, callback: function() { hljs.initHighlightingOnLoad(); } }
+				]
+			});
+		</script>
+	</body>
+</html>
